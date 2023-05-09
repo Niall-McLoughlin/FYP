@@ -1,0 +1,118 @@
+import cv2
+import numpy as np
+import picamera
+import subprocess
+import time
+import re
+import os
+import pymongo
+import csv
+from pymongo import MongoClient
+
+# Replace the connection string with your MongoDB Atlas connection string
+client = MongoClient("mongodb+srv://niall:bingbong96@cluster0.nhluxoj.mongodb.net/pro;")
+
+# Replace "pro" with your database name and "pantries" with your collection name
+db = client.pro
+collection = db.pantries
+barcodes_collection = db.barcodes
+
+# Find the highest "ourId" value in the collection, or set it to 0 if no documents found
+document = collection.find_one(sort=[("ourId", pymongo.DESCENDING)])
+if document:
+    max_ourId = int(document["ourId"])
+else:
+    max_ourId = 0
+
+# Initialize the Raspberry Pi camera module
+with picamera.PiCamera() as camera:
+    camera.start_preview()
+
+    # Loop that waits for a barcode to be scanned
+    while True:
+        barcode = input("Scan Barcode: ")
+        barcode = barcode.zfill(14)  # Pad the barcode with zeros to make it 14 digits long
+        found = False
+
+        # Search for the barcode in a CSV file
+        with open("/home/niall/Project code/Records/items.csv", "r") as csvfile:
+            reader = csv.reader(csvfile, delimiter=",")
+            for row in reader:
+                if barcode == row[2]:
+                    found = True
+                    print("Found!\n")
+                    currentLine = ",".join(row)
+                    print(currentLine)
+                    name = row[4]
+                    amount = row[5]
+                    break
+
+        # If barcode not found in CSV file, search for it in the MongoDB Atlas 'barcodes' collection
+        if not found:
+            barcode_document = barcodes_collection.find_one({"barcode": barcode})
+            if barcode_document:
+                found = True
+                print("Found in MongoDB Atlas 'barcodes' collection!\n")
+                name = barcode_document["name"]
+                amount = barcode_document["amount"]
+
+        # If barcode is found, take five pictures and run OCR on each image
+        if found:
+            filenames = []
+            for i in range(5):
+                filename = f"img{i}.png"
+                camera.capture(filename, quality=100)
+                filenames.append(filename)
+            camera.stop_preview()
+
+            date = ""
+            for filename in filenames:
+                # Load the image and convert it to grayscale
+                img = cv2.imread(filename)
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                
+                # Apply thresholding to the image
+                thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+                
+                # Save the thresholded image
+                cv2.imwrite(filename, thresh)
+                
+                # Run OCR on the thresholded image
+                output = subprocess.run(["tesseract", filename, "stdout"], capture_output=True, text=True)
+                print(output.stdout)
+                date_match = re.search(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", output.stdout)
+                if date_match:
+                   
+                    date = date_match.group(0)
+                    print(f"Date found: {date}")
+                time.sleep(1)
+
+            # Insert the item into the database with the barcode, name, amount, and date fields
+            max_ourId += 1
+            new_document = {
+                "name": name,
+                "amount": amount,
+                "barcode": barcode,
+                "date": date,
+                "ourId": str(max_ourId),
+                "anArray": [],
+                "__v": 0,
+            }
+            result = collection.insert_one(new_document)
+            print(result.inserted_id)
+        # If barcode is not found, insert a new document into the database with default values
+        else:
+            print("Barcode Not Found")
+            max_ourId += 1
+            new_document = {
+                "name": "unknown",
+                "amount": "unknown",
+                "barcode": barcode,
+                "date": "",
+                "ourId": str(max_ourId),
+                "anArray": [],
+                "__v": 0,
+            }
+            result = collection.insert_one(new_document)
+            print("Added to 'pantries' collection with name and amount as 'unknown'")
+            print(result.inserted_id)
